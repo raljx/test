@@ -4,12 +4,29 @@ $kubeconfig = New-TemporaryFile
 $output = Join-Path ([System.IO.Path]::GetTempPath()) "aks-inventory-test-$([guid]::NewGuid()).json"
 $guiOutput = Join-Path ([System.IO.Path]::GetTempPath()) "aks-inventory-gui-test-$([guid]::NewGuid()).json"
 $mismatchOutput = Join-Path ([System.IO.Path]::GetTempPath()) "aks-inventory-mismatch-test-$([guid]::NewGuid()).json"
+$invalidSelectionOutput = Join-Path ([System.IO.Path]::GetTempPath()) "aks-inventory-invalid-selection-test-$([guid]::NewGuid()).json"
 $global:badContext = $false
+$global:badSubscriptionSelection = $false
+$global:expectedSubscription = 'sub-test'
+
+# Reproduce Windows PowerShell 5.1 returning a top-level JSON array as one object.
+function ConvertFrom-Json {
+    param([Parameter(ValueFromPipeline)][string]$InputObject)
+    process {
+        $value = Microsoft.PowerShell.Utility\ConvertFrom-Json -InputObject $InputObject
+        if ($value -is [array]) { Write-Output -NoEnumerate $value }
+        else { Write-Output $value }
+    }
+}
 
 function az {
     $global:LASTEXITCODE = 0
     if ($args[0] -eq 'account' -and $args[1] -eq 'list') {
-        return '[{"name":"Test subscription","id":"sub-test","tenantId":"tenant-test","state":"Enabled"}]'
+        return '[{"name":"First subscription","id":"sub-first","tenantId":"tenant-a","state":"Enabled"},{"name":"Selected subscription","id":"sub-selected","tenantId":"tenant-b","state":"Enabled"},{"name":"Disabled subscription","id":"sub-disabled","tenantId":"tenant-c","state":"Disabled"}]'
+    }
+    if ($args -contains '--subscription') {
+        $actualSubscription = $args[([array]::IndexOf($args, '--subscription') + 1)]
+        if ($actualSubscription -ne $global:expectedSubscription) { throw "Wrong subscription argument: $actualSubscription" }
     }
     if ($args[0] -eq 'aks' -and $args[1] -eq 'list') {
         return '[{"name":"aks-test","resourceGroup":"rg-test","location":"francecentral"}]'
@@ -22,7 +39,15 @@ function az {
 
 function Out-GridView {
     param([string]$Title, [string]$OutputMode, [Parameter(ValueFromPipeline)]$InputObject)
-    process { $InputObject }
+    begin { $rows = @() }
+    process { $rows += $InputObject }
+    end {
+        if ($Title -eq 'Choisir un abonnement Azure' -and $global:badSubscriptionSelection) {
+            [pscustomobject]@{ id = @('sub-first', 'sub-selected') }
+        }
+        elseif ($Title -eq 'Choisir un abonnement Azure') { $rows[1] }
+        else { $rows[0] }
+    }
 }
 
 function kubectl {
@@ -59,18 +84,26 @@ try {
     if ($data.resources.secrets.count -ne 1) { throw 'Secret count incorrect.' }
     if ($data.resources.secrets.PSObject.Properties.Name -contains 'items') { throw 'Secret data was exported.' }
     if ($data.azure.aks.name -ne 'aks-test') { throw 'AKS identity incorrect.' }
+    $global:expectedSubscription = 'sub-selected'
     & $scriptPath -SkipLogin -KubeConfigPath $kubeconfig.FullName -OutputPath $guiOutput
     $guiData = Get-Content -LiteralPath $guiOutput -Raw | ConvertFrom-Json
-    if ($guiData.selection.subscriptionId -ne 'sub-test' -or $guiData.selection.context -ne 'aks-test') { throw 'Graphical selection incorrect.' }
+    if ($guiData.selection.subscriptionId -ne 'sub-selected' -or $guiData.selection.context -ne 'aks-test') { throw 'Graphical selection incorrect.' }
     $global:badContext = $true
+    $global:expectedSubscription = 'sub-test'
     $rejected = $false
     try {
         & $scriptPath -SkipLogin -KubeConfigPath $kubeconfig.FullName -OutputPath $mismatchOutput -SubscriptionId 'sub-test' -ResourceGroup 'rg-test' -ClusterName 'aks-test' -Context 'aks-test'
     }
     catch { $rejected = $_.Exception.Message -match 'different du cluster AKS' }
     if (-not $rejected -or (Test-Path -LiteralPath $mismatchOutput)) { throw 'Mismatched Kubernetes context was not rejected.' }
+    $global:badContext = $false
+    $global:badSubscriptionSelection = $true
+    $rejected = $false
+    try { & $scriptPath -SkipLogin -KubeConfigPath $kubeconfig.FullName -OutputPath $invalidSelectionOutput }
+    catch { $rejected = $_.Exception.Message -match 'un seul identifiant' }
+    if (-not $rejected -or (Test-Path -LiteralPath $invalidSelectionOutput)) { throw 'Multiple subscription IDs were not rejected.' }
     Write-Host 'AKS inventory smoke test passed.'
 }
 finally {
-    Remove-Item -LiteralPath $output, $guiOutput, $mismatchOutput, $kubeconfig.FullName -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $output, $guiOutput, $mismatchOutput, $invalidSelectionOutput, $kubeconfig.FullName -ErrorAction SilentlyContinue
 }

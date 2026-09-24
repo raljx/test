@@ -19,23 +19,39 @@ function Write-Log {
 function Invoke-JsonCommand {
     param([string]$Command, [string[]]$Arguments)
     Write-Log "$Command $($Arguments -join ' ')"
-    $output = & $Command @Arguments 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "$Command a echoue (code $LASTEXITCODE) : $($output -join ' ')"
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        # Windows PowerShell 5.1 treats native stderr as an error with Stop.
+        $ErrorActionPreference = 'Continue'
+        $output = & $Command @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($exitCode -ne 0) {
+        throw "$Command a echoue (code $exitCode) : $($output -join ' ')"
     }
     $text = ($output -join "`n").Trim()
     if (-not $text) { return $null }
-    return ConvertFrom-Json -InputObject $text
+    $parsed = ConvertFrom-Json -InputObject $text
+    # ConvertFrom-Json may emit a JSON array as one pipeline object (notably in
+    # Windows PowerShell 5.1). Emit each top-level element explicitly.
+    if ($parsed -is [array]) {
+        foreach ($item in $parsed) { Write-Output $item }
+        return
+    }
+    return $parsed
 }
 
 function Invoke-AzJson {
     param([string[]]$Arguments)
-    return Invoke-JsonCommand -Command 'az' -Arguments ($Arguments + @('--only-show-errors', '--output', 'json'))
+    Invoke-JsonCommand -Command 'az' -Arguments ($Arguments + @('--only-show-errors', '--output', 'json'))
 }
 
 function Invoke-KubectlJson {
     param([string[]]$Arguments)
-    return Invoke-JsonCommand -Command 'kubectl' -Arguments (@('--kubeconfig', $KubeConfigPath, '--context', $Context) + $Arguments)
+    Invoke-JsonCommand -Command 'kubectl' -Arguments (@('--kubeconfig', $KubeConfigPath, '--context', $Context) + $Arguments)
 }
 
 function Select-One {
@@ -272,7 +288,11 @@ if (-not $SkipLogin) {
 if (-not $SubscriptionId) {
     $subscriptions = @(Invoke-AzJson -Arguments @('account', 'list', '--all') | Where-Object { $_.state -eq 'Enabled' })
     $choice = Select-One -Items @($subscriptions | ForEach-Object { [pscustomobject]@{ name = $_.name; id = $_.id; tenantId = $_.tenantId } }) -Title 'Choisir un abonnement Azure'
-    $SubscriptionId = $choice.id
+    $selectedIds = @($choice.id)
+    if ($selectedIds.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$selectedIds[0]) -or ([string]$selectedIds[0]) -match '\s') {
+        throw 'Le choix graphique doit contenir un seul identifiant d abonnement Azure.'
+    }
+    $SubscriptionId = [string]$selectedIds[0]
 }
 Write-Log "Abonnement selectionne : $SubscriptionId"
 
